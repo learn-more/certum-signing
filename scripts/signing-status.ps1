@@ -124,8 +124,7 @@ $notes = switch ($state)
     'signed'
     {
         @(
-            "> **Signed release.** Signed by ``$($results[0].Signer)``.",
-            '> Right-click, Properties, Digital Signatures to check it yourself.'
+            "> **Signed release.** Signed by ``$($results[0].Signer)``."
         )
     }
     'unsigned'
