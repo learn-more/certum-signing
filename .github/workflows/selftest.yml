@@ -1,0 +1,77 @@
+name: selftest
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  selftest:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # The part that fails silently. A wrong TOTP code is indistinguishable from a refused login from the
+      # outside, so the generator is checked against RFC 6238 - no account, no install, no certificate store.
+      - name: TOTP generator against RFC 6238
+        run: ./scripts/connect-simplysign.ps1 -SelfTest
+        shell: pwsh
+
+      - name: PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -ErrorAction Stop
+          $issues = Invoke-ScriptAnalyzer -Path ./scripts -Recurse -Settings ./PSScriptAnalyzerSettings.psd1
+          $issues | Format-Table -AutoSize
+          if ($issues) { throw "$($issues.Count) PSScriptAnalyzer finding(s)." }
+
+      # Two files with a known answer, so the reporting path is exercised without an account: a Microsoft-signed
+      # system binary, and something that cannot be signed at all.
+      - name: Stage files with a known signature state
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path fixtures | Out-Null
+          Copy-Item "$env:WINDIR\System32\notepad.exe" fixtures\signed.exe
+          Set-Content fixtures\unsigned.txt 'not a signed binary'
+
+      - name: Report on a signed file
+        id: signed
+        uses: ./
+        with:
+          stage: report
+          path: fixtures/signed.exe
+          notes-path: signed-notes.md
+
+      - name: Report on an unsigned file
+        id: unsigned
+        uses: ./
+        with:
+          stage: report
+          path: fixtures/unsigned.txt
+
+      # An unset secret has to read as "not configured", not as a failure: that is what keeps forks and
+      # unconfigured repositories building.
+      - name: Check what the action reported
+        shell: pwsh
+        env:
+          SIGNED_SIGNING: ${{ steps.signed.outputs.signing }}
+          SIGNED_STATUS: ${{ steps.signed.outputs.status }}
+          UNSIGNED_STATUS: ${{ steps.unsigned.outputs.status }}
+        run: |
+          $expected = @{
+            'signing on a repository with no settings' = @($env:SIGNED_SIGNING, 'false')
+            'status of a Microsoft-signed binary'      = @($env:SIGNED_STATUS, 'signed')
+            'status of a text file'                    = @($env:UNSIGNED_STATUS, 'unsigned')
+          }
+          $bad = @()
+          foreach ($case in $expected.GetEnumerator())
+          {
+            $actual, $want = $case.Value
+            Write-Host ("  {0,-42} expected '{1}', got '{2}'" -f $case.Key, $want, $actual)
+            if ($actual -ne $want) { $bad += $case.Key }
+          }
+          if ($bad) { throw "Wrong: $($bad -join ', ')" }
+
+          if (-not (Test-Path signed-notes.md)) { throw 'notes-path was given but nothing was written.' }
+          Get-Content signed-notes.md

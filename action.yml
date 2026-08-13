@@ -1,0 +1,182 @@
+name: 'Certum code signing'
+description: 'Authenticode-sign Windows binaries with a Certum cloud certificate through SimplySign, and report what came out signed.'
+author: 'learn-more'
+
+branding:
+  icon: 'shield'
+  color: 'blue'
+
+inputs:
+  path:
+    description: >
+      Files to sign and report on. Newline- or comma-separated. Required for every stage except `setup`.
+    required: false
+  embedded-path:
+    description: >
+      Helpers extracted back out of the files above, signed earlier in the build. Reported on but not counted;
+      a signed download carrying an unsigned helper fails the run.
+    required: false
+  description:
+    description: >
+      signtool /d - the name Windows shows in the UAC and SmartScreen dialogs, for files with no FileDescription
+      of their own. A binary with a version resource keeps the string that is in it.
+    required: false
+  description-url:
+    description: 'signtool /du. Defaults to the repository this workflow is running in.'
+    required: false
+  notes-path:
+    description: 'Where to write the markdown signing block for the release notes. Skipped when not given.'
+    required: false
+  require-signed:
+    description: >
+      `auto` (default) fails the run when signing was configured and a file still came out unsigned, and passes
+      when it was never configured. `true` / `false` decide it outright.
+    required: false
+    default: 'auto'
+  stage:
+    description: >
+      `all` (default) is install, log in, sign, report - the whole thing in one step, for a build that signs at
+      the end. Split it with `setup`, `sign` and `report` when helpers have to be signed before the build that
+      embeds them; `sign` and `report` may each be called more than once.
+    required: false
+    default: 'all'
+  otp-uri:
+    description: 'The whole otpauth://totp/... URI from SimplySign enrolment. A secret.'
+    required: false
+  username:
+    description: 'SimplySign account name. A secret.'
+    required: false
+  certificate-sha1:
+    description: 'SHA-1 thumbprint of the signing certificate. Public, so a repository variable rather than a secret.'
+    required: false
+  timestamp-server:
+    description: 'RFC 3161 timestamp server. Defaults to http://time.certum.pl.'
+    required: false
+  intermediate-url:
+    description: 'Intermediate certificate to embed in the chain. Defaults to Certum CCSCA 2021.'
+    required: false
+
+outputs:
+  signing:
+    description: '`true` when the Certum settings were all present, so signing was attempted.'
+    value: ${{ steps.check.outputs.signing }}
+  status:
+    description: '`signed`, `partial` or `unsigned`, read back off the files. Empty unless a report stage ran.'
+    value: ${{ steps.status.outputs.status }}
+  summary:
+    description: 'One-line human-readable version of the above.'
+    value: ${{ steps.status.outputs.summary }}
+
+runs:
+  using: composite
+  steps:
+    # Decided in its own step because `secrets` cannot be reached from a step-level `if:` but a step output can,
+    # and because "not configured" has to read as a warning rather than a failure: a fork, or a repository that
+    # simply has no account yet, still builds a release - unsigned, and labelled as such.
+    - name: Check for signing configuration
+      id: check
+      shell: pwsh
+      env:
+        CERTUM_OTP_URI: ${{ inputs.otp-uri }}
+        CERTUM_USERNAME: ${{ inputs.username }}
+        CERTUM_CERTIFICATE_SHA1: ${{ inputs.certificate-sha1 }}
+        INPUT_STAGE: ${{ inputs.stage }}
+        INPUT_PATH: ${{ inputs.path }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+
+        if ($env:INPUT_STAGE -notin @('all', 'setup', 'sign', 'report'))
+        {
+            throw "Unknown stage '$env:INPUT_STAGE'. Use all, setup, sign or report."
+        }
+        if ($env:INPUT_STAGE -ne 'setup' -and [string]::IsNullOrWhiteSpace($env:INPUT_PATH))
+        {
+            throw "The '$env:INPUT_STAGE' stage needs a 'path': there is nothing to sign or report on."
+        }
+
+        $required = 'CERTUM_OTP_URI', 'CERTUM_USERNAME', 'CERTUM_CERTIFICATE_SHA1'
+        $missing = @($required | Where-Object { [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_)) })
+
+        if ($missing.Count -eq 0)
+        {
+            Add-Content $env:GITHUB_OUTPUT 'signing=true'
+            # The thumbprint is public and printed here on purpose: a wrong one is far easier to spot than a
+            # masked ***, and it is the value that goes stale when the certificate is renewed.
+            Write-Host "All Certum settings present - this build will be signed with $env:CERTUM_CERTIFICATE_SHA1."
+        }
+        else
+        {
+            Add-Content $env:GITHUB_OUTPUT 'signing=false'
+            Write-Host "::warning title=Code signing::Unsigned build: missing $($missing -join ', '). See SIGNING.md."
+        }
+
+    # The certificate lives in Certum's cloud HSM; SimplySign Desktop is the local smart-card emulator that makes
+    # it visible to signtool. Worth doing as late in the build as the signing allows: one TOTP code has to cover
+    # the session, and a second login inside the same 30-second step reuses the code, which Certum may refuse.
+    - name: Set up Certum SimplySign
+      if: steps.check.outputs.signing == 'true' && (inputs.stage == 'all' || inputs.stage == 'setup')
+      shell: pwsh
+      env:
+        CERTUM_OTP_URI: ${{ inputs.otp-uri }}
+        CERTUM_USERNAME: ${{ inputs.username }}
+        CERTUM_CERTIFICATE_SHA1: ${{ inputs.certificate-sha1 }}
+      run: |
+        & '${{ github.action_path }}/scripts/install-simplysign.ps1'
+        & '${{ github.action_path }}/scripts/configure-simplysign.ps1'
+        & '${{ github.action_path }}/scripts/connect-simplysign.ps1'
+
+    # Inputs go through env rather than into the script text: a description with a quote in it would otherwise
+    # end up parsed as PowerShell.
+    - name: Sign
+      if: steps.check.outputs.signing == 'true' && (inputs.stage == 'all' || inputs.stage == 'sign')
+      shell: pwsh
+      env:
+        CERTUM_CERTIFICATE_SHA1: ${{ inputs.certificate-sha1 }}
+        CERTUM_TIMESTAMP_SERVER: ${{ inputs.timestamp-server }}
+        CERTUM_INTERMEDIATE_URL: ${{ inputs.intermediate-url }}
+        CERTUM_DESCRIPTION_URL: ${{ inputs.description-url }}
+        INPUT_PATH: ${{ inputs.path }}
+        INPUT_DESCRIPTION: ${{ inputs.description }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $paths = @($env:INPUT_PATH -split '[\r\n,]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+
+        $signArgs = @{ Path = $paths }
+        if ($env:INPUT_DESCRIPTION) { $signArgs['Description'] = $env:INPUT_DESCRIPTION }
+
+        & '${{ github.action_path }}/scripts/sign-files.ps1' @signArgs
+
+    # Runs whether signing happened or not, and reads the answer off the files rather than off "did the signing
+    # step run". Also fills SIGNING_STATUS / SIGNING_SUMMARY in the environment for the steps that follow.
+    - name: Report signing status
+      id: status
+      if: inputs.stage == 'all' || inputs.stage == 'report'
+      shell: pwsh
+      env:
+        INPUT_PATH: ${{ inputs.path }}
+        INPUT_EMBEDDED_PATH: ${{ inputs.embedded-path }}
+        INPUT_NOTES_PATH: ${{ inputs.notes-path }}
+        INPUT_REQUIRE_SIGNED: ${{ inputs.require-signed }}
+        INPUT_SIGNING: ${{ steps.check.outputs.signing }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+
+        function Split-Input
+        {
+            param([string]$Value)
+            return @($Value -split '[\r\n,]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        }
+
+        # auto is the useful default: demand signatures exactly when the settings said there would be some.
+        $require = switch ($env:INPUT_REQUIRE_SIGNED)
+        {
+            'true'  { $true }
+            'false' { $false }
+            default { $env:INPUT_SIGNING -eq 'true' }
+        }
+
+        $statusArgs = @{ Path = Split-Input $env:INPUT_PATH; RequireSigned = $require }
+        if ($env:INPUT_EMBEDDED_PATH) { $statusArgs['EmbeddedPath'] = Split-Input $env:INPUT_EMBEDDED_PATH }
+        if ($env:INPUT_NOTES_PATH) { $statusArgs['NotesPath'] = $env:INPUT_NOTES_PATH }
+
+        & '${{ github.action_path }}/scripts/signing-status.ps1' @statusArgs
